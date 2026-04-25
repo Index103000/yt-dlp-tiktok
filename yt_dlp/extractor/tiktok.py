@@ -386,17 +386,309 @@ class TikTokBaseIE(InfoExtractor):
         return subtitles
 
     def _parse_url_key(self, url_key):
+        """
+        解析 TikTok UrlKey 中携带的编码、清晰度档位、码率信息。
+
+        UrlKey 示例：
+            v090446c0000bdimjn89pog8ra75btp0_h264_720p_1258633
+            v15044gf0000d61nue7og65sn6pteb4g_bytevc1_1080p_1511797
+
+        注意：
+        - UrlKey 里的 720p / 1080p / 540p 更适合作为“质量档位”；
+        - 不应该优先作为真实 width / height；
+        - 真实 width / height 应优先来自 PlayAddr.Width / PlayAddr.Height。
+        """
         format_id, codec, res, bitrate = self._search_regex(
-            r'v[^_]+_(?P<id>(?P<codec>[^_]+)_(?P<res>\d+p)_(?P<bitrate>\d+))', url_key,
-            'url key', default=(None, None, None, None), group=('id', 'codec', 'res', 'bitrate'))
+            r'v[^_]+_(?P<id>(?P<codec>[^_]+)_(?P<res>\d+p)_(?P<bitrate>\d+))',
+            url_key,
+            'url key',
+            default=(None, None, None, None),
+            group=('id', 'codec', 'res', 'bitrate'))
+
         if not format_id:
             return {}, None
+
         return {
+            # format_id 仍然使用 codec_res_bitrate 这种结构，便于 list-formats 区分档位
             'format_id': format_id,
-            'vcodec': 'h265' if codec == 'bytevc1' else codec,
+
+            # bytevc1 实际对应 HEVC / H.265
+            # bytevc2 当前通常不可播放，后续逻辑会额外降权
+            'vcodec': self._normalize_tiktok_vcodec(codec),
+
+            # UrlKey 末尾码率通常是 bps，yt-dlp 的 tbr 单位是 Kbps
             'tbr': int_or_none(bitrate, scale=1000) or None,
+
+            # quality 只用于排序，不代表真实分辨率
             'quality': qualities(self.QUALITIES)(res),
         }, res
+
+    @staticmethod
+    def _normalize_tiktok_vcodec(codec):
+        """
+        标准化 TikTok 返回的视频编码字段。
+
+        TikTok 不同接口中，编码字段可能来自：
+        - UrlKey: h264 / bytevc1 / bytevc2
+        - CodecType: h264 / h265_hvc1
+        - codecType: h264
+
+        统一转换后，方便 yt-dlp 的格式排序和业务侧判断。
+        """
+        if not codec:
+            return None
+
+        codec = str(codec).lower()
+
+        if codec in ('h264', 'avc', 'avc1'):
+            return 'h264'
+
+        if codec in ('bytevc1', 'h265', 'h265_hvc1', 'hevc', 'hvc1'):
+            return 'h265'
+
+        # bytevc2 是字节自己的 H.266/VVC 相关格式，当前通常不可播放
+        if codec in ('bytevc2', 'h266', 'vvc'):
+            return 'bytevc2'
+
+        return codec
+
+    def _parse_tiktok_video_extra(self, video_extra):
+        """
+        解析 TikTok VideoExtra 字段。
+
+        VideoExtra 通常是一个 JSON 字符串，例如：
+            {
+                "audio_bit_rate": 64787,
+                "mvmaf": "...",
+                "ufq": "..."
+            }
+
+        当前主要使用：
+        - audio_bit_rate：音频码率，通常单位是 bps，需要转换为 Kbps
+        """
+        if not video_extra:
+            return {}
+
+        if isinstance(video_extra, dict):
+            return video_extra
+
+        if not isinstance(video_extra, str):
+            return {}
+
+        try:
+            return self._parse_json(video_extra, None, fatal=False) or {}
+        except ExtractorError:
+            return {}
+
+    @staticmethod
+    def _get_tiktok_addr_url_key(addr):
+        """
+        兼容 TikTok 地址结构中的 UrlKey 字段。
+
+        Web hydration 常见：
+            UrlKey
+
+        App API 常见：
+            url_key
+        """
+        if not isinstance(addr, dict):
+            return None
+
+        return addr.get('UrlKey') or addr.get('url_key')
+
+    @staticmethod
+    def _get_tiktok_addr_width_height(addr):
+        """
+        从当前地址结构中读取真实 width / height。
+
+        这里读取的是“当前 format 自己”的结构化宽高，例如：
+            bitrateInfo[].PlayAddr.Width / Height
+            PlayAddrStruct.Width / Height
+            DownloadAddrStruct.Width / Height
+
+        注意：
+        - 不从 UrlKey 里的 720p / 1080p 推算；
+        - 不在这里 fallback 到顶层 video.width / video.height；
+        - 顶层宽高只能代表顶层 playAddr，不应泛化到 bitrateInfo 多档。
+        """
+        if not isinstance(addr, dict):
+            return None, None
+
+        width = int_or_none(addr.get('Width') or addr.get('width'))
+        height = int_or_none(addr.get('Height') or addr.get('height'))
+
+        if width and height:
+            return width, height
+
+        return None, None
+
+    @staticmethod
+    def _get_tiktok_addr_filesize(addr):
+        """
+        从当前地址结构中读取文件大小。
+
+        TikTok 常见字段：
+            DataSize
+            data_size
+
+        单位通常是 bytes。
+        """
+        if not isinstance(addr, dict):
+            return None
+
+        return int_or_none(addr.get('DataSize') or addr.get('data_size'))
+
+    def _infer_tiktok_dimension_from_res(self, res, ratio):
+        """
+        根据 UrlKey 里的清晰度档位兜底推算宽高。
+
+        这是最后兜底逻辑，不应优先使用。
+
+        原因：
+        - TikTok 的 UrlKey 中 720p / 540p 不一定代表真实视频高度；
+        - 有些 720p 档实际是 576x1024；
+        - 有些 540p 档实际是 576x1024；
+        - 所以只在没有结构化 Width / Height 时才使用。
+
+        参数：
+        - res: 例如 720p / 540p / 1080p
+        - ratio: 顶层视频宽高比，通常为 width / height
+        """
+        dimension = int_or_none(res[:-1]) if res else None
+        if not dimension:
+            return None, None
+
+        # yt-dlp 原逻辑保留：TikTok 的 540p 档常见实际宽度为 576
+        if dimension == 540:
+            dimension = 576
+
+        if ratio < 1:
+            # 竖屏：这里把 dimension 当作宽度档位进行估算
+            y = int(dimension / ratio)
+            return dimension, y - (y % 2)
+
+        # 横屏：这里把 dimension 当作高度档位进行估算
+        x = int(dimension * ratio)
+        return x + (x % 2), dimension
+
+    def _build_tiktok_addr_meta(self, addr, *, ratio=None, allow_res_fallback=False):
+        """
+        从一个 TikTok 地址结构中提取通用 format metadata。
+
+        可处理：
+        - PlayAddr
+        - PlayAddrStruct
+        - DownloadAddrStruct
+        - App API 中的 play_addr / download_addr 等结构
+
+        返回字段可能包含：
+        - width
+        - height
+        - filesize
+        - format_id
+        - vcodec
+        - tbr
+        - quality
+
+        重要规则：
+        - 优先使用 addr.Width / addr.Height；
+        - UrlKey 只用于 format_id / vcodec / tbr / quality；
+        - 只有 allow_res_fallback=True 时，才允许根据 UrlKey 的 720p 等推算宽高。
+        """
+        if not isinstance(addr, dict):
+            return {}
+
+        url_key = self._get_tiktok_addr_url_key(addr)
+        parsed_meta, res = self._parse_url_key(url_key or '')
+
+        width, height = self._get_tiktok_addr_width_height(addr)
+
+        # 只有在结构化宽高不存在，并且调用方明确允许时，才从 UrlKey 档位推算宽高
+        if (not width or not height) and allow_res_fallback and ratio:
+            width, height = self._infer_tiktok_dimension_from_res(res, ratio)
+
+        meta = {
+            **parsed_meta,
+            'filesize': self._get_tiktok_addr_filesize(addr),
+            'width': width,
+            'height': height,
+        }
+
+        return filter_dict(meta)
+
+    def _build_tiktok_bitrate_meta(self, bitrate_info, *, ratio=None):
+        """
+        从 Web 链路的 video.bitrateInfo[] 当前档位中提取完整 metadata。
+
+        这类数据通常最准确，因为每一档都有自己的：
+        - PlayAddr.Width
+        - PlayAddr.Height
+        - PlayAddr.DataSize
+        - PlayAddr.UrlKey
+        - Bitrate
+        - BitrateFPS
+        - CodecType
+        - GearName
+        - VideoExtra
+
+        注意：
+        - 不使用顶层 video.width / video.height 覆盖当前档；
+        - 当前档没有 Width / Height 时，才允许 UrlKey + ratio 兜底推算。
+        """
+        if not isinstance(bitrate_info, dict):
+            return {}
+
+        play_addr = traverse_obj(bitrate_info, ('PlayAddr', {dict})) or {}
+
+        # 先从当前 PlayAddr 解析通用信息
+        meta = self._build_tiktok_addr_meta(
+            play_addr,
+            ratio=ratio,
+            allow_res_fallback=True)
+
+        video_extra = self._parse_tiktok_video_extra(bitrate_info.get('VideoExtra'))
+
+        # CodecType 比 UrlKey 更明确，优先使用 CodecType
+        vcodec = self._normalize_tiktok_vcodec(
+            bitrate_info.get('CodecType')
+            or bitrate_info.get('codec_type')
+            or meta.get('vcodec'))
+
+        # Bitrate 是当前档总码率，通常单位 bps；yt-dlp tbr 单位 Kbps
+        tbr = (
+            int_or_none(bitrate_info.get('Bitrate') or bitrate_info.get('bit_rate'), scale=1000)
+            or meta.get('tbr'))
+
+        # BitrateFPS 是当前档帧率
+        fps = int_or_none(
+            bitrate_info.get('BitrateFPS')
+            or bitrate_info.get('FPS')
+            or bitrate_info.get('fps'))
+
+        # VideoExtra.audio_bit_rate 通常是 bps，yt-dlp abr 单位 Kbps
+        abr = int_or_none(video_extra.get('audio_bit_rate'), scale=1000)
+
+        # GearName 用作更可读的 format_id，例如：
+        # normal_720_0 / adapt_lowest_1080_1 / lowest_540_0
+        format_id = (
+            bitrate_info.get('GearName')
+            or bitrate_info.get('gear_name')
+            or meta.get('format_id'))
+
+        # format_note 不建议塞太多调试字段，避免 list-formats 太乱
+        format_note = bitrate_info.get('GearName') or bitrate_info.get('gear_name')
+
+        meta.update(filter_dict({
+            'format_id': format_id,
+            'tbr': tbr,
+            'fps': fps,
+            'vcodec': vcodec,
+            'acodec': 'aac',
+            'abr': abr,
+            'format_note': format_note,
+        }))
+
+        return filter_dict(meta)
 
     def _parse_aweme_video_app(self, aweme_detail):
         aweme_id = aweme_detail['aweme_id']
@@ -560,76 +852,201 @@ class TikTokBaseIE(InfoExtractor):
         }
 
     def _extract_web_formats(self, aweme_detail):
+        """
+        解析 TikTok Web 页面 hydration 数据中的 formats。
+
+        当前 Web 链路主要来源：
+        1. video.bitrateInfo[].PlayAddr.UrlList
+           - 最完整、最准确的多档格式来源
+           - 每一档有自己的 Width / Height / DataSize / Bitrate / CodecType / FPS
+
+        2. video.playAddr
+           - 顶层播放地址
+           - 宽高通常对应 video.width / video.height
+           - 如果存在 PlayAddrStruct，则优先用 PlayAddrStruct 补充 metadata
+           - 如果 PlayAddrStruct.UrlKey 能匹配 bitrateInfo[].PlayAddr.UrlKey，则复用 bitrateInfo 的完整 metadata
+
+        3. video.downloadAddr / video.download.url
+           - 下载地址，通常可能带水印
+           - 如果存在 DownloadAddrStruct，则优先用 DownloadAddrStruct
+           - 否则只能用 video 顶层字段弱兜底
+
+        4. music.playUrl
+           - slideshow 音频兜底
+        """
         COMMON_FORMAT_INFO = {
             'ext': 'mp4',
             'vcodec': 'h264',
             'acodec': 'aac',
         }
+
         video_info = traverse_obj(aweme_detail, ('video', {dict})) or {}
+
+        # 顶层 width / height 主要代表顶层 playAddr，不应该覆盖 bitrateInfo 多档
         play_width = int_or_none(video_info.get('width'))
         play_height = int_or_none(video_info.get('height'))
         ratio = try_call(lambda: play_width / play_height) or 0.5625
+
         formats = []
 
+        # 用于让顶层 playAddr 通过 PlayAddrStruct.UrlKey 反查 bitrateInfo 的完整 metadata
+        bitrate_meta_by_url_key = {}
+
+        # 用于让顶层 playAddr 通过 URL 反查 bitrateInfo 的完整 metadata
+        # 某些情况下 PlayAddrStruct.UrlKey 缺失，但 URL 与 bitrateInfo URL 一致。
+        bitrate_meta_by_url = {}
+
+        # 1. 优先加入 bitrateInfo formats
+        # 这部分 metadata 通常最完整，所以放在 play/download 前面。
+        # _remove_duplicate_formats 只按 URL 去重，不合并 metadata；
+        # 因此更完整的 bitrateInfo 必须先 append。
         for bitrate_info in traverse_obj(video_info, ('bitrateInfo', lambda _, v: v['PlayAddr']['UrlList'])):
-            format_info, res = self._parse_url_key(
-                traverse_obj(bitrate_info, ('PlayAddr', 'UrlKey', {str})) or '')
-            # bytevc2 is bytedance's own custom h266/vvc codec, as-of-yet unplayable
+            play_addr = traverse_obj(bitrate_info, ('PlayAddr', {dict})) or {}
+
+            format_info = self._build_tiktok_bitrate_meta(bitrate_info, ratio=ratio)
+
             is_bytevc2 = format_info.get('vcodec') == 'bytevc2'
-            format_info.update({
-                'format_note': 'UNPLAYABLE' if is_bytevc2 else None,
-                'preference': -100 if is_bytevc2 else -1,
-                'filesize': traverse_obj(bitrate_info, ('PlayAddr', 'DataSize', {int_or_none})),
-            })
 
-            if dimension := (res and int(res[:-1])):
-                if dimension == 540:  # '540p' is actually 576p
-                    dimension = 576
-                if ratio < 1:  # portrait: res/dimension is width
-                    y = int(dimension / ratio)
-                    format_info.update({
-                        'width': dimension,
-                        'height': y - (y % 2),
-                    })
-                else:  # landscape: res/dimension is height
-                    x = int(dimension * ratio)
-                    format_info.update({
-                        'width': x + (x % 2),
-                        'height': dimension,
-                    })
+            if is_bytevc2:
+                format_info.update({
+                    'preference': -100,
+                    'format_note': join_nonempty(
+                        format_info.get('format_note'),
+                        'UNPLAYABLE',
+                        delim=', '),
+                })
+            else:
+                format_info.setdefault('preference', -1)
 
-            for video_url in traverse_obj(bitrate_info, ('PlayAddr', 'UrlList', ..., {url_or_none})):
+            url_key = self._get_tiktok_addr_url_key(play_addr)
+            if url_key:
+                bitrate_meta_by_url_key[url_key] = format_info.copy()
+
+            for video_url in traverse_obj(play_addr, ('UrlList', ..., {url_or_none})):
+                normalized_url = self._proto_relative_url(video_url)
+
+                bitrate_meta_by_url[normalized_url] = format_info.copy()
+
                 formats.append({
                     **COMMON_FORMAT_INFO,
                     **format_info,
-                    'url': self._proto_relative_url(video_url),
+                    'url': normalized_url,
                 })
 
-        # We don't have res string for play formats, but need quality for sorting & de-duplication
-        play_quality = traverse_obj(formats, (lambda _, v: v['width'] == play_width, 'quality', any))
+        # 用于 play format 的 quality 兜底：
+        # 如果 play_width 能在已有 bitrateInfo formats 中找到，就复用对应 quality。
+        play_quality = traverse_obj(formats, (lambda _, v: v.get('width') == play_width, 'quality', any))
 
-        for play_url in traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none})):
-            formats.append({
-                **COMMON_FORMAT_INFO,
-                'format_id': 'play',
-                'url': self._proto_relative_url(play_url),
+        # 2. 解析顶层 playAddr
+        #
+        # 不单独把 PlayAddrStruct.UrlList append 成新 format，避免和 bitrateInfo / playAddr 重复。
+        # PlayAddrStruct 更适合作为 playAddr 的 metadata 来源。
+        play_addr_struct = traverse_obj(video_info, ('PlayAddrStruct', {dict})) or {}
+        play_addr_url_key = self._get_tiktok_addr_url_key(play_addr_struct)
+
+        # 2.1 优先通过 UrlKey 匹配 bitrateInfo metadata
+        play_meta = bitrate_meta_by_url_key.get(play_addr_url_key, {}).copy() if play_addr_url_key else {}
+
+        # 2.2 如果没有匹配到 bitrateInfo，则从 PlayAddrStruct 自身解析
+        if not play_meta:
+            play_meta = self._build_tiktok_addr_meta(
+                play_addr_struct,
+                ratio=ratio,
+                allow_res_fallback=False)
+
+        # 2.3 PlayAddrStruct 没有宽高时，才使用顶层 video.width / video.height
+        # 顶层宽高只用于 play，不用于 bitrateInfo 多档。
+        if not play_meta.get('width') or not play_meta.get('height'):
+            play_meta.update(filter_dict({
                 'width': play_width,
                 'height': play_height,
-                'quality': play_quality,
+            }))
+
+        # 2.4 顶层 playAddr 没有 tbr / filesize 时，可用顶层字段弱兜底
+        # 注意：这只是 play 的弱兜底，不用于覆盖 bitrateInfo 多档。
+        if not play_meta.get('filesize'):
+            play_meta['filesize'] = int_or_none(video_info.get('size'))
+
+        if not play_meta.get('tbr'):
+            play_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
+
+        if not play_meta.get('vcodec'):
+            play_meta['vcodec'] = self._normalize_tiktok_vcodec(video_info.get('codecType'))
+
+        if not play_meta.get('quality'):
+            play_meta['quality'] = play_quality
+
+        play_meta = filter_dict(play_meta)
+
+        for play_url in traverse_obj(video_info, ('playAddr', ((..., 'src'), None), {url_or_none})):
+            normalized_url = self._proto_relative_url(play_url)
+
+            # 如果 play URL 和某个 bitrateInfo URL 一致，则复用 bitrateInfo metadata；
+            # 但 format_id 仍保留为 play，方便 list-formats 看出来源。
+            matched_meta = bitrate_meta_by_url.get(normalized_url, {}).copy()
+            if matched_meta:
+                current_play_meta = matched_meta
+            else:
+                current_play_meta = play_meta.copy()
+
+            formats.append({
+                **COMMON_FORMAT_INFO,
+                **filter_dict(current_play_meta),
+                'format_id': 'play',
+                'url': normalized_url,
             })
+
+        # 3. 解析 downloadAddr
+        #
+        # downloadAddr 通常可能是水印视频。
+        # 如果没有 DownloadAddrStruct，只能用顶层 video 字段做弱兜底；
+        # 不建议根据 UrlKey 强行推算，除非结构体里真的有 UrlKey。
+        download_addr_struct = traverse_obj(video_info, ('DownloadAddrStruct', {dict})) or {}
+
+        download_meta = self._build_tiktok_addr_meta(
+            download_addr_struct,
+            ratio=ratio,
+            allow_res_fallback=False)
+
+        # DownloadAddrStruct 不存在时，使用顶层 video 字段弱兜底
+        # 这里不保证绝对准确，但比 list-formats unknown 更有参考价值。
+        if not download_meta.get('width') or not download_meta.get('height'):
+            download_meta.update(filter_dict({
+                'width': play_width,
+                'height': play_height,
+            }))
+
+        if not download_meta.get('filesize'):
+            download_meta['filesize'] = int_or_none(video_info.get('size'))
+
+        if not download_meta.get('tbr'):
+            download_meta['tbr'] = int_or_none(video_info.get('bitrate'), scale=1000)
+
+        if not download_meta.get('vcodec'):
+            download_meta['vcodec'] = self._normalize_tiktok_vcodec(video_info.get('codecType')) or 'h264'
+
+        download_meta['acodec'] = download_meta.get('acodec') or 'aac'
+
+        download_meta = filter_dict(download_meta)
 
         for download_url in traverse_obj(video_info, (('downloadAddr', ('download', 'url')), {url_or_none})):
             formats.append({
                 **COMMON_FORMAT_INFO,
+                **download_meta,
                 'format_id': 'download',
                 'url': self._proto_relative_url(download_url),
-                'format_note': 'watermarked',
+                'format_note': join_nonempty(
+                    download_meta.get('format_note'),
+                    'watermarked',
+                    delim=', '),
                 'preference': -2,
             })
 
         self._remove_duplicate_formats(formats)
 
-        # Is it a slideshow with only audio for download?
+        # 4. slideshow 音频兜底
+        #
+        # 如果没有任何视频 format，但存在 music.playUrl，则按音频处理。
         if not formats and traverse_obj(aweme_detail, ('music', 'playUrl', {url_or_none})):
             audio_url = aweme_detail['music']['playUrl']
             ext = traverse_obj(parse_qs(audio_url), (
@@ -642,9 +1059,12 @@ class TikTokBaseIE(InfoExtractor):
                 'vcodec': 'none',
             })
 
-        # Filter out broken formats, see https://github.com/yt-dlp/yt-dlp/issues/11034
-        return [f for f in formats if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com']
-
+        # 过滤 TikTok 已知坏格式
+        # 参见 yt-dlp 原注释：https://github.com/yt-dlp/yt-dlp/issues/11034
+        return [
+            f for f in formats
+            if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com'
+        ]
     def _parse_aweme_video_web(self, aweme_detail, webpage_url, video_id, extract_flat=False):
         author_info = traverse_obj(aweme_detail, (('authorInfo', 'author', None), {
             'channel': ('nickname', {str}),
