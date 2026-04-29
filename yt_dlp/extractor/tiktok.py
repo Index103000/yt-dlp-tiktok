@@ -1065,6 +1065,7 @@ class TikTokBaseIE(InfoExtractor):
             f for f in formats
             if urllib.parse.urlparse(f['url']).hostname != 'www.tiktok.com'
         ]
+
     def _parse_aweme_video_web(self, aweme_detail, webpage_url, video_id, extract_flat=False):
         author_info = traverse_obj(aweme_detail, (('authorInfo', 'author', None), {
             'channel': ('nickname', {str}),
