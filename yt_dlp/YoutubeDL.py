@@ -3414,7 +3414,17 @@ class YoutubeDL:
         new_info, files_to_move = self.pre_process(info_dict, 'before_dl', files_to_move)
         replace_info_dict(new_info)
 
-        if self.params.get('skip_download'):
+        # 由于阿里需求，这里判断当前 best 视频的分辨率是否小于 720p ，若小于，则强行跳过视频下载
+        force_skip_download = False
+        if info_dict['width'] and info_dict['height']:
+            if info_dict['width'] >= info_dict['height']:
+                if info_dict['height'] < 720:
+                    force_skip_download = True
+            else:
+                if info_dict['width'] < 720:
+                    force_skip_download = True
+
+        if self.params.get('skip_download') or force_skip_download:
             info_dict['filepath'] = temp_filename
             info_dict['__finaldir'] = os.path.dirname(os.path.abspath(full_filename))
             info_dict['__files_to_move'] = files_to_move
